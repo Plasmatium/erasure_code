@@ -1,0 +1,13 @@
+[package]
+name = "erasure_code"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.75"
+ndarray = { version = "0.15.6", features = ["rayon"] }
+ndarray-linalg = { version = "0.16.0", features = ["openblas-system"] }
+num-bigint = "0.4.3"
+once_cell = "1.18.0"
