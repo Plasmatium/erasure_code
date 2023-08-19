@@ -1,15 +1,21 @@
-use std::{fs, path::PathBuf, str::FromStr};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, BufReader, BufWriter},
+    path::PathBuf,
+    str::FromStr,
+};
 
 use anyhow::anyhow;
+use glob::glob;
 use ndarray::prelude::*;
 use num_bigint::{BigInt, Sign};
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
-static PRECISE_CTRL: usize = 65536;
+static PRECISE_CTRL: usize = 65536 << 8;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MetaData {
@@ -44,37 +50,14 @@ impl FromStr for MetaData {
             erasure_parts,
         })
     }
-    // type Error = anyhow::Error;
-
-    // fn try_from(value: &str) -> Result<Self, Self::Error> {
-    //     let caps = REGEX_FOR_METADATA
-    //         .captures(value)
-    //         .ok_or(anyhow!("mailformed pattern: {value}"))?;
-
-    //     let data_parts: usize = caps
-    //         .get(1)
-    //         .ok_or(anyhow!("pattern missing data_parts"))?
-    //         .as_str()
-    //         .parse()?;
-    //     let erasure_parts: usize = caps
-    //         .get(2)
-    //         .ok_or(anyhow!("pattern missing erasure_parts"))?
-    //         .as_str()
-    //         .parse()?;
-
-    //     Ok(MetaData {
-    //         data_parts,
-    //         erasure_parts,
-    //     })
-    // }
 }
 
 #[derive(Debug)]
 pub struct DataBlock(pub usize, pub BigInt);
 
 impl DataBlock {
-    pub fn load_from_file(file_name: PathBuf) -> anyhow::Result<Self> {
-        let order = extract_order_from_file_name(&file_name)?;
+    pub fn load_from_file(file_name: &PathBuf) -> anyhow::Result<Self> {
+        let order = extract_order_from_file_path(&file_name)?;
         let buf = fs::read(file_name)?;
         let buf = BigInt::from_bytes_le(Sign::Plus, &buf);
         Ok(DataBlock(order, buf))
@@ -93,20 +76,21 @@ impl DataBlock {
 
     pub fn get_file_path(order: usize, dir_name: &PathBuf, meta_ref: &MetaData) -> PathBuf {
         let file_name = if order < meta_ref.data_parts {
-            format!("{order}.d")
+            format!("{order}.d.block")
         } else {
-            format!("{order}.e")
+            format!("{order}.e.block")
         };
         dir_name.join(file_name)
     }
 }
 
-fn extract_order_from_file_name(file_name: &PathBuf) -> anyhow::Result<usize> {
-    let stem = file_name
-        .file_stem()
-        .ok_or("malformed file name")
-        .map_err(|e| anyhow!(e))?;
-    Ok(stem.to_string_lossy().parse()?)
+fn extract_order_from_file_path(file_path: &PathBuf) -> anyhow::Result<usize> {
+    let file_name = file_path
+        .file_name()
+        .ok_or(anyhow!("missing file name"))?
+        .to_string_lossy();
+    let prefix = &file_name[..file_name.len() - ".x.block".len()];
+    Ok(prefix.parse()?)
 }
 
 #[derive(Debug)]
@@ -148,17 +132,6 @@ impl ErasureEntity {
             .map(|(a, b)| a * b)
             .sum();
         DataBlock(order, data >> PRECISE_CTRL)
-    }
-
-    pub fn gen_erasure_file(&self, count: usize) -> Vec<DataBlock> {
-        let mut ret = Vec::with_capacity(count);
-        let (r, _) = self.matrix.dim();
-
-        for o in r..r + count {
-            let data_block = self.calc_data(o);
-            ret.push(data_block);
-        }
-        ret
     }
 }
 
@@ -267,6 +240,21 @@ impl FileHandler {
         // save erasure parts to disk
         debug!("loading erasure entity");
         let ee = ErasureEntity::load_from_blocks(data_blocks)?;
+        self.gen_and_save_blocks(&ee)?;
+
+        // save metadata to disk
+        let md_path = self.dir_path.join("metadata.json");
+        let buf = serde_json::to_string(&self.metadata)?;
+        fs::write(md_path, buf)?;
+
+        Ok(())
+    }
+
+    fn gen_and_save_blocks(&self, ee: &ErasureEntity) -> anyhow::Result<()> {
+        let MetaData {
+            data_parts,
+            erasure_parts,
+        } = self.metadata;
         (0..data_parts + erasure_parts)
             .into_par_iter()
             .for_each(|order| {
@@ -274,7 +262,7 @@ impl FileHandler {
                 if file_path.exists() {
                     let file_path = file_path.to_string_lossy().into_owned();
                     warn!(file_path, "file exists, no need to calc and rebuild again");
-                    return
+                    return;
                 }
 
                 info!(order, "start calculating");
@@ -285,15 +273,58 @@ impl FileHandler {
                     .expect("failed to save file");
             });
 
-        // save metadata to disk
-        let md_path = self.dir_path.join("metadata.json");
-        let buf = serde_json::to_string(&self.metadata)?;
-        fs::write(md_path, buf)?;
-
         Ok(())
     }
 
+    /// rebuild will search for the metadata.json and load the blocks
+    /// if least number of blocks is not satisfied, a `not enough blocks` error will be returned
     pub fn rebuild(&self) -> anyhow::Result<()> {
-        todo!()
+        let p = self.dir_path.join("*.block").to_string_lossy().into_owned();
+        let may_matched = glob(&p)?;
+        let paths: Vec<_> = may_matched.into_iter().filter_map(|m| m.ok()).collect();
+        let MetaData { data_parts, .. } = self.metadata;
+        let block_count = paths.len();
+        if block_count < data_parts {
+            return Err(anyhow!(
+                "not enough blocks, got {block_count}, required at least {data_parts}"
+            ));
+        }
+
+        debug!("loading blocks");
+        let blocks: Vec<_> = paths
+            .into_par_iter()
+            .map(|ref path| {
+                DataBlock::load_from_file(path).expect(&format!("should load file {path:?}"))
+            })
+            .take(data_parts)
+            .collect();
+
+        debug!("setup equation matrix");
+        let ee = ErasureEntity::load_from_blocks(blocks)?;
+        self.gen_and_save_blocks(&ee)?;
+
+        info!("start assambling file from blocks");
+        let file_dest = OpenOptions::new().append(true).create(true).open(&self.file_path)?;
+        let mut file_dest = BufWriter::new(file_dest);
+
+        let p = self
+            .dir_path
+            .join("*.d.block")
+            .to_string_lossy()
+            .into_owned();
+        let may_matched = glob(&p)?;
+        let mut paths: Vec<_> = may_matched.into_iter().filter_map(|m| m.ok()).collect();
+        paths.sort_by_key(|p| {
+            extract_order_from_file_path(&p).expect("order should exists")
+        });
+        for p in paths {
+            let file_parts = File::open(p)?;
+            let mut file_parts = BufReader::new(file_parts);
+            io::copy(&mut file_parts, &mut file_dest)?;
+        }
+
+        info!("all done!");
+
+        Ok(())
     }
 }

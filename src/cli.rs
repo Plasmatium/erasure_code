@@ -22,7 +22,7 @@ pub enum Commands {
         data_dir: PathBuf,
 
         #[arg(default_value = "12+4", short = 'p')]
-        pattern: String, 
+        pattern: String,
     },
 
     /// Rebuild try to rebuild the source data from remain parts
@@ -32,6 +32,6 @@ pub enum Commands {
         data_dir: PathBuf,
 
         #[arg(required = true, short = 'o')]
-        output_file_name: PathBuf
+        output_file_name: PathBuf,
     },
 }
