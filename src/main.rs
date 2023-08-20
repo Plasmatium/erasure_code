@@ -21,7 +21,7 @@ fn main() -> anyhow::Result<()> {
             let metadata = pattern.parse()?;
             let fh = FileHandler::new(metadata, file_name, data_dir);
 
-            fh.split()
+            fh.reconstruct()
         }
         cli::Commands::Rebuild {
             data_dir,

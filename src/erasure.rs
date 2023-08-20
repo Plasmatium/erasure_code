@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, BufWriter},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom},
     path::PathBuf,
     str::FromStr,
 };
@@ -207,8 +207,48 @@ impl FileHandler {
         }
     }
 
-    /// split will split the file into parts and add erasure parts as configured in metadata
-    pub fn split(&self) -> anyhow::Result<()> {
+    fn split_and_write(&self) -> anyhow::Result<()> {
+        // calculating chunks and chunk size;
+        let src_file = File::open(&self.file_path)?;
+        let src_file_size = src_file.metadata()?.len();
+        let MetaData { data_parts, .. } = self.metadata;
+        let chunk_size = src_file_size as usize / data_parts;
+
+        let paths: Vec<_> = (0..data_parts)
+            .map(|order| DataBlock::get_file_path(order, &self.dir_path, &self.metadata))
+            .collect();
+        let result: anyhow::Result<Vec<_>> = paths
+            .par_iter()
+            .enumerate()
+            .map(|(chunk_idx, dest_path)| -> anyhow::Result<()> {
+                let dest_file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .open(dest_path)?;
+
+                let mut dest_writer = BufWriter::new(dest_file);
+                let start_pos = chunk_idx * chunk_size;
+                let bytes_to_copy = if chunk_idx == data_parts - 1 {
+                    src_file_size - start_pos as u64
+                } else {
+                    chunk_size as u64
+                };
+
+                let mut src_file = src_file.try_clone()?;
+                src_file.seek(SeekFrom::Start(start_pos as u64))?;
+                let mut src_reader = BufReader::new(src_file).take(bytes_to_copy);
+
+                io::copy(&mut src_reader, &mut dest_writer)?;
+
+                Ok(())
+            })
+            .collect();
+        let _ = result?;
+        Ok(())
+    }
+
+    /// reconstruct will split the file into parts and add erasure parts as configured in metadata
+    pub fn reconstruct(&self) -> anyhow::Result<()> {
         debug!("start loading file");
         let file_buf = fs::read(&self.file_path)?;
         let MetaData {
@@ -218,21 +258,18 @@ impl FileHandler {
         let file_size = file_buf.len();
         let block_size = file_size / data_parts;
 
-        debug!(data_parts, erasure_parts, "start splitting file");
-        let data_blocks = (0..data_parts)
+        debug!(data_parts, erasure_parts, "start splitting files");
+        self.split_and_write()?;
+
+        debug!("start loading blocks");
+        let paths = self.get_block_paths()?;
+        let data_blocks = paths
             .into_par_iter()
-            .map(|part_idx| {
-                let start = part_idx * block_size;
-                let end = if part_idx == data_parts - 1 {
-                    // last parts, catch all of remain bytes
-                    file_size
-                } else {
-                    start + block_size
-                };
-                (part_idx, &file_buf[start..end])
-            })
-            .map(|(order, block_buf)| {
-                let buf = BigInt::from_bytes_le(Sign::Plus, block_buf);
+            .map(|file_path| {
+                let block_buf = fs::read(&file_path).expect("should read file");
+                let buf = BigInt::from_bytes_le(Sign::Plus, &block_buf);
+                let order =
+                    extract_order_from_file_path(&file_path).expect("order should be extracted");
                 DataBlock(order, buf)
             })
             .collect();
@@ -276,12 +313,17 @@ impl FileHandler {
         Ok(())
     }
 
-    /// rebuild will search for the metadata.json and load the blocks
-    /// if least number of blocks is not satisfied, a `not enough blocks` error will be returned
-    pub fn rebuild(&self) -> anyhow::Result<()> {
+    fn get_block_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
         let p = self.dir_path.join("*.block").to_string_lossy().into_owned();
         let may_matched = glob(&p)?;
         let paths: Vec<_> = may_matched.into_iter().filter_map(|m| m.ok()).collect();
+        Ok(paths)
+    }
+
+    /// rebuild will search for the metadata.json and load the blocks
+    /// if least number of blocks is not satisfied, a `not enough blocks` error will be returned
+    pub fn rebuild(&self) -> anyhow::Result<()> {
+        let paths = self.get_block_paths()?;
         let MetaData { data_parts, .. } = self.metadata;
         let block_count = paths.len();
         if block_count < data_parts {
@@ -304,7 +346,10 @@ impl FileHandler {
         self.gen_and_save_blocks(&ee)?;
 
         info!("start assambling file from blocks");
-        let file_dest = OpenOptions::new().append(true).create(true).open(&self.file_path)?;
+        let file_dest = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.file_path)?;
         let mut file_dest = BufWriter::new(file_dest);
 
         let p = self
@@ -314,9 +359,7 @@ impl FileHandler {
             .into_owned();
         let may_matched = glob(&p)?;
         let mut paths: Vec<_> = may_matched.into_iter().filter_map(|m| m.ok()).collect();
-        paths.sort_by_key(|p| {
-            extract_order_from_file_path(&p).expect("order should exists")
-        });
+        paths.sort_by_key(|p| extract_order_from_file_path(&p).expect("order should exists"));
         for p in paths {
             let file_parts = File::open(p)?;
             let mut file_parts = BufReader::new(file_parts);
