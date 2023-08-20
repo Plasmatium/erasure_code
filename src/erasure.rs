@@ -13,9 +13,9 @@ use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-static PRECISE_CTRL: usize = 65536 << 8;
+static PRECISE_CTRL1: usize = 65537;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MetaData {
@@ -131,7 +131,7 @@ impl ErasureEntity {
             .zip(x_vector.iter())
             .map(|(a, b)| a * b)
             .sum();
-        DataBlock(order, data >> PRECISE_CTRL)
+        DataBlock(order, data >> PRECISE_CTRL1)
     }
 }
 
@@ -145,7 +145,7 @@ fn build_vector(curr_order: usize, max_order: usize) -> Vec<BigInt> {
 
 fn build_vector_with_data(curr_order: usize, max_order: usize, data: BigInt) -> Vec<BigInt> {
     let mut ret = Vec::with_capacity(max_order + 1);
-    ret.push(data << PRECISE_CTRL);
+    ret.push(data << PRECISE_CTRL1);
     let vector = build_vector(curr_order, max_order);
     ret.extend(vector);
     ret
@@ -295,12 +295,12 @@ impl FileHandler {
         (0..data_parts + erasure_parts)
             .into_par_iter()
             .for_each(|order| {
-                let file_path = DataBlock::get_file_path(order, &self.dir_path, &self.metadata);
-                if file_path.exists() {
-                    let file_path = file_path.to_string_lossy().into_owned();
-                    warn!(file_path, "file exists, no need to calc and rebuild again");
-                    return;
-                }
+                // let file_path = DataBlock::get_file_path(order, &self.dir_path, &self.metadata);
+                // if file_path.exists() {
+                //     let file_path = file_path.to_string_lossy().into_owned();
+                //     warn!(file_path, "file exists, no need to calc and rebuild again");
+                //     return;
+                // }
 
                 info!(order, "start calculating");
                 let calced_block = ee.calc_data(order);

@@ -21,7 +21,7 @@ pub enum Commands {
         #[arg(required = true, short = 'd')]
         data_dir: PathBuf,
 
-        #[arg(default_value = "12+4", short = 'p')]
+        #[arg(default_value = "3+2", short = 'p')]
         pattern: String,
     },
 
