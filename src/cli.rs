@@ -33,5 +33,8 @@ pub enum Commands {
 
         #[arg(required = true, short = 'o')]
         output_file_name: PathBuf,
+
+        #[arg(short = 'f', default_value = "false")]
+        force: bool,
     },
 }

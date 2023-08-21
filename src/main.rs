@@ -26,13 +26,14 @@ fn main() -> anyhow::Result<()> {
         cli::Commands::Rebuild {
             data_dir,
             output_file_name,
+            force,
         } => {
             let md_file_path = data_dir.join("metadata.json");
             let md_str = fs::read_to_string(md_file_path)?;
             let metadata = serde_json::from_str(&md_str)?;
             let fh = FileHandler::new(metadata, output_file_name, data_dir);
 
-            fh.rebuild()
+            fh.rebuild(force)
         }
     }
 }

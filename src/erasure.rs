@@ -250,13 +250,10 @@ impl FileHandler {
     /// reconstruct will split the file into parts and add erasure parts as configured in metadata
     pub fn reconstruct(&self) -> anyhow::Result<()> {
         debug!("start loading file");
-        let file_buf = fs::read(&self.file_path)?;
         let MetaData {
             data_parts,
             erasure_parts,
         } = self.metadata;
-        let file_size = file_buf.len();
-        let block_size = file_size / data_parts;
 
         debug!(data_parts, erasure_parts, "start splitting files");
         self.split_and_write()?;
@@ -322,7 +319,7 @@ impl FileHandler {
 
     /// rebuild will search for the metadata.json and load the blocks
     /// if least number of blocks is not satisfied, a `not enough blocks` error will be returned
-    pub fn rebuild(&self) -> anyhow::Result<()> {
+    pub fn rebuild(&self, force: bool) -> anyhow::Result<()> {
         let paths = self.get_block_paths()?;
         let MetaData { data_parts, .. } = self.metadata;
         let block_count = paths.len();
@@ -345,11 +342,17 @@ impl FileHandler {
         let ee = ErasureEntity::load_from_blocks(blocks)?;
         self.gen_and_save_blocks(&ee)?;
 
+        let file_dest_exists = self.file_path.exists();
+        if file_dest_exists && !force {
+            return Err(anyhow!("dest file exists, please rerun with `--force` to overwrite the dest file"))
+        }
+
         info!("start assambling file from blocks");
-        let file_dest = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&self.file_path)?;
+        let mut file_dest = OpenOptions::new().append(true).to_owned();
+        if !file_dest_exists {
+            file_dest.create(true);
+        }
+        let file_dest = file_dest.open(&self.file_path)?;
         let mut file_dest = BufWriter::new(file_dest);
 
         let p = self
