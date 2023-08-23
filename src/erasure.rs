@@ -15,6 +15,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
+use crate::my_br::MyBigRational;
+
 static PRECISE_CTRL1: usize = 65537;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -53,13 +55,13 @@ impl FromStr for MetaData {
 }
 
 #[derive(Debug)]
-pub struct DataBlock(pub usize, pub BigInt);
+pub struct DataBlock(usize, MyBigRational);
 
 impl DataBlock {
     pub fn load_from_file(file_name: &PathBuf) -> anyhow::Result<Self> {
         let order = extract_order_from_file_path(&file_name)?;
         let buf = fs::read(file_name)?;
-        let buf = BigInt::from_bytes_le(Sign::Plus, &buf);
+        let buf = MyBigRational::from_bytes(&buf);
         Ok(DataBlock(order, buf))
     }
 
@@ -68,7 +70,7 @@ impl DataBlock {
     pub fn save_to_file(self, dir_name: &PathBuf, meta_ref: &MetaData) -> anyhow::Result<()> {
         let order = self.0;
         let file_path = Self::get_file_path(order, dir_name, meta_ref);
-        let (_, bytes) = self.1.to_bytes_le();
+        let bytes = self.1.to_bytes();
         fs::write(file_path, bytes)?;
 
         Ok(())
