@@ -5,20 +5,56 @@ use std::{
     path::PathBuf,
 };
 
-use num_bigint::{BigInt, BigUint, Sign, ToBigUint};
-use num_rational::{BigRational, Ratio};
+use num_bigint::{BigInt, BigUint, Sign};
+use num_rational::Ratio;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
-// data layout
-// meta: [numer_size][numer_padding_num][denorm_padding_num]
-// main: [numer][numer_padding][numer_sign][denom][denorm_padding][denom_sign]
-// all: [meta][main]
-// numer_padding_num is count by u64, which means numer_padding_num * 8 in bytes
-// denom is calculated in the same way.
+mod sign_serde {
+    use num_bigint::Sign;
+    use serde::{Deserialize, Deserializer, Serializer};
 
-#[derive(Debug, Clone)]
+    pub fn serialize<S>(data: &Sign, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Custom serialization logic here
+        // For example, you can use serializer.serialize_str(...) or any other serialization method
+        // serializer.serialize_bytes(data)
+        let data_str = match data {
+            Sign::Minus => "minus",
+            Sign::NoSign => "no_sign",
+            Sign::Plus => "plus",
+        };
+        serializer.serialize_str(data_str)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Sign, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Custom deserialization logic here
+        // For example, you can use deserializer.deserialize_str(...) or any other deserialization method
+        // deserializer.deserialize_bytes()
+        let s = String::deserialize(deserializer)?;
+        let ret = match &*s {
+            "minus" => Sign::Minus,
+            "no_sign" => Sign::NoSign,
+            "plus" => Sign::Plus,
+            _ => {
+                return Err(serde::de::Error::unknown_variant(
+                    &s,
+                    &["minus", "no_sign", "plus"],
+                ))
+            }
+        };
+        Ok(ret)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataBlockMeta {
     // data_parts is total data_parts count
     data_parts: u64,
@@ -27,6 +63,7 @@ pub struct DataBlockMeta {
     // erasure_parts is the erasure total parts number
     erasure_parts: u64,
 
+    #[serde(with = "sign_serde")]
     sign: Sign,
     padding: usize,
 
@@ -40,8 +77,31 @@ static PART_EXTRACTOR: Lazy<Regex> = Lazy::new(|| {
 });
 
 impl DataBlockMeta {
-    pub fn new(work_dir: &PathBuf, k_parts: usize, erasure_parts: usize) -> anyhow::Result<Self> {
-        todo!()
+    // create的时候根据参数加载
+    pub fn load_from_params(
+        work_dir: PathBuf,
+        data_parts: u64,
+        curr_part: u64,
+        erasure_parts: u64,
+    ) -> Self {
+        Self {
+            data_parts,
+            curr_part,
+            erasure_parts,
+
+            sign: Sign::Plus,
+            padding: 0, // 稍后读取文件的时候会覆写
+
+            work_dir,
+        }
+    }
+
+    // rebuild的时候，从meta.json加载
+    pub fn load_from_file(work_dir: &PathBuf) -> anyhow::Result<Vec<Self>> {
+        let meta_file_path = work_dir.join("meta.json");
+        let meta_bytes = fs::read(meta_file_path)?;
+        let ret: Vec<Self> = serde_json::from_slice(&meta_bytes)?;
+        Ok(ret)
     }
 
     fn is_erasure_type(&self) -> bool {
@@ -58,6 +118,47 @@ impl DataBlockMeta {
         let file_name = format!("{curr_part}.{ext}");
         self.work_dir.join(file_name)
     }
+
+    pub fn calc_L_item_k_on_x(&self, xs: &[u64], x: u64) -> (u64, Ratio<i64>) {
+        let j = self.curr_part;
+        assert!(
+            xs.contains(&j),
+            "j should present in xs while calc L item, j: {j}, xs: {xs:?}"
+        );
+
+        let r = calc_lagrange_item_at_x(xs, j, x);
+        (j, r)
+    }
+}
+
+fn interpolation_one(blocks: &mut [DataBlock], part_num: u64) -> BigInt {
+    assert_ne!(blocks.len(), 0, "blocks shouldn't be empty");
+    blocks.sort_by_key(|b| b.meta.curr_part);
+
+    let b0_meta = &blocks[0].meta;
+    let data_parts = b0_meta.data_parts;
+    let erasure_parts = b0_meta.erasure_parts;
+
+    let xs: Vec<u64> = blocks
+        .iter()
+        .map(|b| b.meta.curr_part)
+        .take(data_parts as usize)
+        .collect();
+    let ratio_list = blocks
+        .iter()
+        .map(|block| block.meta.calc_L_item_k_on_x(&xs, part_num));
+
+    blocks
+        .iter()
+        .map(|b| (b.meta.curr_part, &b.data))
+        .zip(ratio_list)
+        .fold(
+            BigInt::from(0),
+            |acc, ((curr_part, big_data), (part_num, ratio))| {
+                assert_eq!(curr_part, part_num);
+                acc + big_data * ratio.numer() / ratio.denom()
+            },
+        )
 }
 
 fn get_part_number_from_file_name(p: &PathBuf) -> usize {
@@ -75,9 +176,12 @@ fn get_part_number_from_file_name(p: &PathBuf) -> usize {
     panic!("it should be parsed, got file name: {file_name}");
 }
 
-fn calc_lagrange_list(xs: &[i64], j: i64, x: i64) -> Ratio<i64> {
+fn calc_lagrange_item_at_x(xs: &[u64], j: u64, x: u64) -> Ratio<i64> {
+    let j = j as i64;
+    let x = x as i64;
     xs.iter()
-        .filter(|&&xi| xi != j)
+        .map(|xi| *xi as i64)
+        .filter(|&xi| xi != j)
         .map(|xi| Ratio::new(x - xi, j - xi))
         .fold(Ratio::from(1), |acc, c| acc * c)
 }
@@ -88,6 +192,29 @@ pub struct DataBlock {
 }
 
 impl DataBlock {
+    pub fn calc_lagrange_interpolation(&self, xs: &[u64]) -> BigInt {
+        let x = self.meta.curr_part;
+        assert!(
+            !xs.contains(&x),
+            "x should not present in xs while calc L interpolation, x: {x}, xs: {xs:?}"
+        );
+
+        todo!()
+    }
+
+    pub fn calc_lagrange_item(&self, xs: &[u64], x: u64) -> BigInt {
+        let j = self.meta.curr_part;
+        assert!(
+            xs.contains(&j),
+            "j should present in xs while calc L item, j: {j}, xs: {xs:?}"
+        );
+
+        let k = calc_lagrange_item_at_x(xs, j, x);
+        let numer = k.numer();
+        let denom = k.denom();
+        &self.data * numer / denom
+    }
+
     // load_data will loads the data from file.
     // filename indicated by self
     // step: Vec::with_capacity
@@ -236,7 +363,7 @@ mod tests {
     use num_rational::{BigRational, Ratio};
     use tracing::info;
 
-    use super::{calc_lagrange_list, BigUintFitter, DataBlock, DataBlockMeta};
+    use super::{calc_lagrange_item_at_x, BigUintFitter, DataBlock, DataBlockMeta};
 
     fn make_meta() -> DataBlockMeta {
         DataBlockMeta {
@@ -264,34 +391,29 @@ mod tests {
     }
 
     #[test]
-    fn test_dashu() {
-        use dashu::integer::Sign;
-        let mut file = File::open("/tmp/erasure_test/1.d.block").unwrap();
-        let mut data = vec![];
-        file.read_to_end(&mut data).unwrap();
-        println!("{} size read", data.len());
-        let a = UBig::from_le_bytes(&data);
-        let numer = IBig::from_parts(Sign::Positive, a);
-        let denom = UBig::from_le_bytes(&data[(data.len() / 10)..(data.len() / 3 * 2)]);
-        let xx = numer / denom;
-        println!("{}", xx.bit_len());
-        // let rational = RBig::from_parts(numer, denom);
-        // println!("{:?}", rational.sign())
-    }
-
-    #[test]
     fn test_lagrange() {
-        let xs: Vec<i64> = (0..=20).into_iter().collect();
-        for j in 0..24 {
-            for x in 0..24 {
-                let l = calc_lagrange_list(&xs, j, x);
+        let xs: Vec<u64> = (0..=20).into_iter().collect();
+        for x in 0..24 {
+            for j in 0..24 {
+                let l = calc_lagrange_item_at_x(&xs, j, x);
                 println!("{x}, {j} => {l}");
             }
             println!("=================================\n")
         }
-        // let x = 6;
-        // let j = 3;
-        // let xx = calc_lagrange_list(&xs, j, x);
-        // println!("{xx}");
+    }
+
+    #[test]
+    fn test_lagrange2() {
+        let xs: Vec<u64> = vec![1, 3, 4, 5, 6];
+        for x in 0..=6 {
+            for j in 0..=6 {
+                // if x == j {
+                //     continue
+                // }
+                let l = calc_lagrange_item_at_x(&xs, j, x);
+                println!("{x}, {j} => {l}");
+            }
+            println!("=================================\n")
+        }
     }
 }
