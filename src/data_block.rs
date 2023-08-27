@@ -2,7 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     ops::{MulAssign, Neg},
-    path::PathBuf,
+    path::PathBuf, thread::{self, JoinHandle},
 };
 
 use num_bigint::{BigInt, BigUint, Sign};
@@ -10,7 +10,8 @@ use num_rational::Ratio;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, error};
+use anyhow::anyhow;
 
 mod sign_serde {
     use num_bigint::Sign;
@@ -131,24 +132,17 @@ impl DataBlockMeta {
     }
 }
 
-fn interpolation_one(blocks: &mut [DataBlock], part_num: u64) -> BigInt {
-    assert_ne!(blocks.len(), 0, "blocks shouldn't be empty");
-    blocks.sort_by_key(|b| b.meta.curr_part);
+fn interpolate_one(sorted_blocks: &[DataBlock], xs: &[u64], part_num: u64) -> BigInt {
+    assert_ne!(sorted_blocks.len(), 0, "blocks shouldn't be empty");
 
-    let b0_meta = &blocks[0].meta;
+    let b0_meta = &sorted_blocks[0].meta;
     let data_parts = b0_meta.data_parts;
-    let erasure_parts = b0_meta.erasure_parts;
 
-    let xs: Vec<u64> = blocks
+    let ratio_list = sorted_blocks
         .iter()
-        .map(|b| b.meta.curr_part)
-        .take(data_parts as usize)
-        .collect();
-    let ratio_list = blocks
-        .iter()
-        .map(|block| block.meta.calc_L_item_k_on_x(&xs, part_num));
+        .map(|block| block.meta.calc_L_item_k_on_x(xs, part_num));
 
-    blocks
+    sorted_blocks
         .iter()
         .map(|b| (b.meta.curr_part, &b.data))
         .zip(ratio_list)
@@ -159,6 +153,47 @@ fn interpolation_one(blocks: &mut [DataBlock], part_num: u64) -> BigInt {
                 acc + big_data * ratio.numer() / ratio.denom()
             },
         )
+}
+
+pub fn interpolate_all_and_dump(blocks: &mut [DataBlock]) -> anyhow::Result<()> {
+    assert_ne!(blocks.len(), 0, "blocks shouldn't be empty");
+    blocks.sort_by_key(|b| b.meta.curr_part);
+    let b0_meta = &blocks[0].meta;
+    let data_parts = b0_meta.data_parts;
+    let erasure_parts = b0_meta.erasure_parts;
+
+    let xs: Vec<u64> = blocks
+        .iter()
+        .map(|b| b.meta.curr_part)
+        .take(data_parts as usize)
+        .collect();
+
+    let mut join_handlers = vec![];
+    for part_num in 0..data_parts + erasure_parts {
+        if xs.contains(&part_num) {
+            info!(part_num, "exists, no need to rebuild");
+            continue
+        }
+        let rebuild_data = interpolate_one(blocks, &xs, part_num);
+        let mut rebuild_meta = b0_meta.clone();
+        rebuild_meta.curr_part = part_num;
+        let rebuild_block = DataBlock {
+            data: rebuild_data,
+            meta: rebuild_meta,
+        };
+        let h = thread::spawn(move || {
+            if let Err(err) = rebuild_block.dump_data() {
+                error!(part_num, err=&err.to_string()[..255], "rebuild failed")
+            }
+        });
+        join_handlers.push(h);
+    }
+
+    for h in join_handlers {
+        h.join().unwrap();
+    } 
+
+    Ok(())
 }
 
 fn get_part_number_from_file_name(p: &PathBuf) -> usize {
