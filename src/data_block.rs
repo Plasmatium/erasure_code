@@ -479,12 +479,21 @@ mod tests {
 
     #[test]
     fn test_lagrange3() {
-        let xs = vec![2, 3, 4, 5];
-        let ys = vec![3, -1, 0, 2];
+        let xs = vec![0, 1, 2, 3];
+        let ys = vec![b'g' as u64, b'x' as u64, b'd' as u64, b'n' as u64];
         let mut sum = Ratio::from_integer(0);
         for (&j, y) in xs.iter().zip(ys) {
-            let k = calc_lagrange_item_at_x(&xs, j, 1);
-            sum += k * y;
+            let k = calc_lagrange_item_at_x(&xs, j, 2);
+            sum += k * y as i64;
+        }
+        println!("{sum}");
+
+        let mut sum = Ratio::from_integer(0);
+        let xs = vec![1,3,4,5];
+        let ys = vec![b'x' as u64, b'n' as u64, 217, 488];
+        for (&j, y) in xs.iter().zip(ys) {
+            let k = calc_lagrange_item_at_x(&xs, j, 2);
+            sum += k * y as i64;
         }
         println!("{sum}");
     }
