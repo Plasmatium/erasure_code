@@ -2,7 +2,8 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     ops::{MulAssign, Neg},
-    path::PathBuf, thread::{self, JoinHandle},
+    path::PathBuf,
+    thread::{self, JoinHandle},
 };
 
 use num_bigint::{BigInt, BigUint, Sign};
@@ -10,8 +11,7 @@ use num_rational::Ratio;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tracing::{info, error};
-use anyhow::anyhow;
+use tracing::{error, info};
 
 mod sign_serde {
     use num_bigint::Sign;
@@ -172,7 +172,7 @@ pub fn interpolate_all_and_dump(blocks: &mut [DataBlock]) -> anyhow::Result<()> 
     for part_num in 0..data_parts + erasure_parts {
         if xs.contains(&part_num) {
             info!(part_num, "exists, no need to rebuild");
-            continue
+            continue;
         }
         let rebuild_data = interpolate_one(blocks, &xs, part_num);
         let mut rebuild_meta = b0_meta.clone();
@@ -183,7 +183,7 @@ pub fn interpolate_all_and_dump(blocks: &mut [DataBlock]) -> anyhow::Result<()> 
         };
         let h = thread::spawn(move || {
             if let Err(err) = rebuild_block.dump_data() {
-                error!(part_num, err=&err.to_string()[..255], "rebuild failed")
+                error!(part_num, err = &err.to_string()[..255], "rebuild failed")
             }
         });
         join_handlers.push(h);
@@ -191,7 +191,7 @@ pub fn interpolate_all_and_dump(blocks: &mut [DataBlock]) -> anyhow::Result<()> 
 
     for h in join_handlers {
         h.join().unwrap();
-    } 
+    }
 
     Ok(())
 }
@@ -398,7 +398,7 @@ mod tests {
     use num_rational::{BigRational, Ratio};
     use tracing::info;
 
-    use super::{calc_lagrange_item_at_x, BigUintFitter, DataBlock, DataBlockMeta};
+    use super::{calc_lagrange_item_at_x, BigUintFitter, DataBlock, DataBlockMeta, interpolate_all_and_dump};
 
     fn make_meta() -> DataBlockMeta {
         DataBlockMeta {
@@ -450,5 +450,42 @@ mod tests {
             }
             println!("=================================\n")
         }
+    }
+
+    #[test]
+    fn test_integration1() {
+        let work_dir = "/tmp/erasure_test";
+        let data_parts = 3;
+        let erasure_parts = 2;
+
+        let meta_list = [1u64, 3,4,].into_iter()
+            .map(|idx| DataBlockMeta {
+                data_parts,
+                erasure_parts,
+                curr_part: idx,
+                padding: 0,
+                sign: Sign::Plus,
+                work_dir: work_dir.into(),
+            })
+            .collect::<Vec<_>>();
+
+        let mut blocks = meta_list
+            .into_iter()
+            .map(|meta| DataBlock::load_data(meta).unwrap())
+            .collect::<Vec<_>>();
+        
+        interpolate_all_and_dump(&mut blocks).unwrap();
+    }
+
+    #[test]
+    fn test_lagrange3() {
+        let xs = vec![2, 3, 4, 5];
+        let ys = vec![3, -1, 0, 2];
+        let mut sum = Ratio::from_integer(0);
+        for (&j, y) in xs.iter().zip(ys) {
+            let k = calc_lagrange_item_at_x(&xs, j, 1);
+            sum += k * y;
+        }
+        println!("{sum}");
     }
 }
