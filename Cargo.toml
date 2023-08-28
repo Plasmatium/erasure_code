@@ -8,7 +8,6 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.75"
 clap = { version = "4.3.23", features = ["derive"] }
-dashu = "0.3.1"
 glob = "0.3.1"
 ndarray = { version = "0.15.6", features = ["rayon"] }
 num-bigint = "0.4.3"
