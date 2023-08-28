@@ -1,9 +1,8 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    ops::{MulAssign, Neg},
+    ops::Neg,
     path::PathBuf,
-    thread::{self, JoinHandle},
 };
 
 use num_bigint::{BigInt, BigUint, Sign};
@@ -11,7 +10,7 @@ use num_rational::Ratio;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{debug, info};
 
 mod sign_serde {
     use num_bigint::Sign;
@@ -105,12 +104,12 @@ impl DataBlockMeta {
         Ok(ret)
     }
 
-    fn is_erasure_type(&self) -> bool {
+    fn is_erasure_block(&self) -> bool {
         self.curr_part >= self.data_parts
     }
 
     fn get_file_path(&self) -> PathBuf {
-        let ext = if self.is_erasure_type() {
+        let ext = if self.is_erasure_block() {
             "e.block"
         } else {
             "d.block"
@@ -133,16 +132,14 @@ impl DataBlockMeta {
 }
 
 fn interpolate_one(sorted_blocks: &[DataBlock], xs: &[u64], part_num: u64) -> BigInt {
+    info!(part_num, "start interpolating");
     assert_ne!(sorted_blocks.len(), 0, "blocks shouldn't be empty");
-
     let b0_meta = &sorted_blocks[0].meta;
-    let data_parts = b0_meta.data_parts;
-
     let ratio_list = sorted_blocks
         .iter()
         .map(|block| block.meta.calc_L_item_k_on_x(xs, part_num));
 
-    sorted_blocks
+    let ret = sorted_blocks
         .iter()
         .map(|b| (b.meta.curr_part, &b.data))
         .zip(ratio_list)
@@ -152,12 +149,17 @@ fn interpolate_one(sorted_blocks: &[DataBlock], xs: &[u64], part_num: u64) -> Bi
                 assert_eq!(curr_part, part_num);
                 acc + big_data * ratio.numer() / ratio.denom()
             },
-        )
+    );
+    info!(part_num, "end interpolating");
+    ret
 }
 
-pub fn interpolate_all_and_dump(blocks: &mut Vec<DataBlock>, xs: &[u64]) -> anyhow::Result<Vec<DataBlock>> {
+pub fn interpolate_all_and_dump(
+    blocks: &mut Vec<DataBlock>,
+    xs: &[u64],
+) -> anyhow::Result<Vec<DataBlock>> {
     assert_ne!(blocks.len(), 0, "blocks shouldn't be empty");
-    blocks.sort_by_key(|b| b.meta.curr_part);
+    blocks.sort_by_key(|b| b.get_curr_part());
     let b0_meta = &blocks[0].meta.clone();
     let data_parts = b0_meta.data_parts;
     let erasure_parts = b0_meta.erasure_parts;
@@ -167,7 +169,7 @@ pub fn interpolate_all_and_dump(blocks: &mut Vec<DataBlock>, xs: &[u64]) -> anyh
 
     for part_num in 0..data_parts + erasure_parts {
         if xs.contains(&part_num) {
-            info!(part_num, "exists, no need to rebuild");
+            debug!(part_num, "exists, no need to rebuild");
             continue;
         }
         let rebuild_data = interpolate_one(&blocks, &xs, part_num);
@@ -175,7 +177,7 @@ pub fn interpolate_all_and_dump(blocks: &mut Vec<DataBlock>, xs: &[u64]) -> anyh
         rebuild_meta.curr_part = part_num;
         rebuild_meta.sign = rebuild_data.sign();
 
-        if rebuild_meta.is_erasure_type() {
+        if rebuild_meta.is_erasure_block() {
             // no need to padding for erasure type
             rebuild_meta.padding = 0;
         }
@@ -223,27 +225,24 @@ pub struct DataBlock {
 }
 
 impl DataBlock {
-    pub fn calc_lagrange_interpolation(&self, xs: &[u64]) -> BigInt {
-        let x = self.meta.curr_part;
-        assert!(
-            !xs.contains(&x),
-            "x should not present in xs while calc L interpolation, x: {x}, xs: {xs:?}"
-        );
-
-        todo!()
+    pub fn get_work_dir(&self) -> PathBuf {
+        self.meta.work_dir.clone()
     }
 
-    pub fn calc_lagrange_item(&self, xs: &[u64], x: u64) -> BigInt {
-        let j = self.meta.curr_part;
-        assert!(
-            xs.contains(&j),
-            "j should present in xs while calc L item, j: {j}, xs: {xs:?}"
-        );
+    pub fn is_erasure_block(&self) -> bool {
+        self.meta.is_erasure_block()
+    }
+    pub fn get_part_file_name(&self) -> PathBuf {
+        self.meta.get_file_path()
+    }
 
-        let k = calc_lagrange_item_at_x(xs, j, x);
-        let numer = k.numer();
-        let denom = k.denom();
-        &self.data * numer / denom
+    pub fn get_parts_params(&self) -> (u64, u64, u64) {
+        let meta = &self.meta;
+        (meta.data_parts, meta.curr_part, meta.erasure_parts)
+    }
+
+    pub fn get_curr_part(&self) -> u64 {
+        self.meta.curr_part
     }
 
     // load_data will loads the data from file.
@@ -257,13 +256,13 @@ impl DataBlock {
         // step: Vec::with_capacity
         let raw_data_len = fs::metadata(file_path)?.len() as usize;
         // last one is tail padding (which to prevent starting zeros of a numer)
-        let tail_padded_len = if meta.is_erasure_type() {
+        let tail_padded_len = if meta.is_erasure_block() {
             // 如果是计算出的纠删码，那没必要tail padding，因为计算出的肯定是leading_zero去掉了（小端存储，末尾去0）
             raw_data_len
         } else {
             raw_data_len + 1
         };
-        let head_padding_size = if meta.is_erasure_type() {
+        let head_padding_size = if meta.is_erasure_block() {
             0
         } else {
             calc_padding_size(tail_padded_len as usize)
@@ -277,7 +276,6 @@ impl DataBlock {
         let raw_section = &mut data[head_padding_size..raw_data_len + head_padding_size];
         file.read_exact(raw_section)?;
 
-        info!("vec -> bu, part: {}", meta.curr_part);
         let bu = BigUintFitter::from_vec(data);
         // let bu = BigUint::from_bytes_le(&data);
         let data = BigInt::from_biguint(meta.sign, bu);
@@ -294,7 +292,7 @@ impl DataBlock {
         let file_path = meta.get_file_path();
         // delete this file first
         if let Err(err) = fs::remove_file(&file_path) {
-            info!(err = err.to_string(), "suppres the deletion error");
+            debug!(err = err.to_string(), "suppress the deletion error");
         }
         let mut file = OpenOptions::new()
             .append(true)
@@ -302,7 +300,7 @@ impl DataBlock {
             .open(&file_path)?;
 
         // exam if last head_padded is not 0xff. if not, data should minus 1
-        if !meta.is_erasure_type() {
+        if !meta.is_erasure_block() {
             let rebuilt_padded_value: Vec<_> =
                 data.iter_u64_digits().take(meta.padding / 8).collect();
             let &last_one = rebuilt_padded_value
@@ -319,7 +317,6 @@ impl DataBlock {
             None => data.neg().to_biguint().expect("it shouldn't be None"),
         };
 
-        info!("bu -> vec, part: {}", meta.curr_part);
         let mut data = BigUintFitter::to_vec(bu);
         // let mut data = bu.to_bytes_le();
         let data_len = data.len();
@@ -328,7 +325,7 @@ impl DataBlock {
         // meta.padding is head_padding
         // last one is tail padding (which to prevent starting zeros of a numer)
         // 如果是计算出的纠删码，那没必要tail padding，因为计算出的肯定是leading_zero去掉了（小端存储，末尾去0）
-        let end = if meta.is_erasure_type() {
+        let end = if meta.is_erasure_block() {
             data_len
         } else {
             data_len - 1
@@ -361,7 +358,6 @@ struct BigUintFitter {
 impl BigUintFitter {
     // from_vec is used to build BigInt from file
     fn from_vec(mut bytes: Vec<u8>) -> BigUint {
-        info!("from_vec before convert: {bytes:?}");
         // u64_len is 8
         let u64_len = std::mem::size_of::<u64>();
         assert_eq!(bytes.len() % u64_len, 0);
@@ -375,11 +371,8 @@ impl BigUintFitter {
             u64_vec = Vec::from_raw_parts(u64_ptr as *mut u64, u64_len, u64_len);
             std::mem::forget(bytes);
 
-            info!("from_vec after convert: {u64_vec:?}");
-
             let fitter = Self { data: u64_vec };
             let ret = std::mem::transmute(fitter);
-            info!("from_vec after, bu: {ret}");
             ret
         }
     }
@@ -387,20 +380,16 @@ impl BigUintFitter {
     // to_vec is used to store BigInt to file
     fn to_vec(bu: BigUint) -> Vec<u8> {
         unsafe {
-            info!("to_vec before, bu: {bu}");
             // step 1. transmute bu to fitter
             let fitter: Self = std::mem::transmute(bu);
             let Self { data } = fitter;
 
-            info!("to_vec before convert: {data:?}");
             // step 2. transmute Vec<u64> to Vec<u8>
             let u8_len = data.len() * std::mem::size_of::<u64>();
             let raw_u64: *const u64 = data.as_ptr();
             let raw_u8: *const u8 = raw_u64 as *const u8;
             std::mem::forget(data);
             let u8_vec = Vec::from_raw_parts(raw_u8 as *mut u8, u8_len, u8_len);
-
-            info!("to_vec after convert: {u8_vec:?}");
 
             u8_vec
         }
@@ -427,14 +416,17 @@ fn calc_padding_size(tail_padded_len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::{File, self}, io::Read};
-    use num_bigint::Sign;
-    use num_rational::Ratio;
-    use tracing::info;
     use super::{
         calc_lagrange_item_at_x, interpolate_all_and_dump, save_meta, BigUintFitter, DataBlock,
         DataBlockMeta,
     };
+    use num_bigint::Sign;
+    use num_rational::Ratio;
+    use std::{
+        fs::{self, File},
+        io::Read,
+    };
+    use tracing::info;
 
     #[test]
     fn test_integration1() {
@@ -466,7 +458,7 @@ mod tests {
 
         let rebuilt_blocks = interpolate_all_and_dump(&mut blocks, &xs).unwrap();
         blocks.extend(rebuilt_blocks);
-        blocks.sort_by_key(|b| b.meta.curr_part);
+        blocks.sort_by_key(|b| b.get_curr_part());
         save_meta(&blocks).unwrap();
         for b in blocks {
             if !xs.contains(&b.meta.curr_part) {
@@ -492,7 +484,7 @@ mod tests {
 
         let rebuilt_blocks = interpolate_all_and_dump(&mut blocks, &xs).unwrap();
         blocks.extend(rebuilt_blocks);
-        blocks.sort_by_key(|b| b.meta.curr_part);
+        blocks.sort_by_key(|b| b.get_curr_part());
         save_meta(&blocks).unwrap();
         for b in blocks {
             if !xs.contains(&b.meta.curr_part) {

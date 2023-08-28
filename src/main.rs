@@ -1,17 +1,12 @@
 mod cli;
-mod erasure;
-mod my_br;
 mod data_block;
 mod manager;
 
 use std::fs;
 
 use clap::Parser;
-use data_block::{DataBlockMeta, DataBlock};
-use manager::Manager;
-use num_bigint::Sign;
-use tracing::info;
-// use erasure::FileHandler;
+use manager::{Manager, PartsParam};
+use tracing::error;
 
 use crate::cli::Cli;
 
@@ -25,18 +20,26 @@ fn main() -> anyhow::Result<()> {
             data_dir,
             ref pattern,
         } => {
-            let parts_params = pattern.parse()?;
+            let parts_params: PartsParam = pattern.parse()?;
+            Manager::split_file_to_parts(&file_name, parts_params.0, &data_dir)?;
             let mgr = Manager::new(parts_params, &data_dir)?;
-            mgr.build_erasure_file()?
+            mgr.reconstruct_parts()?
         }
         cli::Commands::Rebuild {
             data_dir,
             output_file_name,
             force,
         } => {
+            let exists = fs::metadata(&output_file_name).is_ok();
+            if exists && !force {
+                error!("file: '{output_file_name:?}' exists, use --force to overwrite");
+                return Ok(());
+            }
             let md_file_path = data_dir.join("meta.json");
             let mgr = Manager::load_from_meta(&md_file_path)?;
-            mgr.reconstruct()?
+            let (data_parts, _) = mgr.get_parts_params();
+            mgr.reconstruct_parts()?;
+            Manager::merge_parts_to_file(&output_file_name, &data_dir, data_parts)?
         }
     }
     Ok(())
