@@ -8,6 +8,7 @@ use std::{
 use num_bigint::{BigInt, BigUint, Sign};
 use num_rational::Ratio;
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -134,22 +135,19 @@ impl DataBlockMeta {
 fn interpolate_one(sorted_blocks: &[DataBlock], xs: &[u64], part_num: u64) -> BigInt {
     info!(part_num, "start interpolating");
     assert_ne!(sorted_blocks.len(), 0, "blocks shouldn't be empty");
-    let b0_meta = &sorted_blocks[0].meta;
     let ratio_list = sorted_blocks
-        .iter()
+        .par_iter()
         .map(|block| block.meta.calc_L_item_k_on_x(xs, part_num));
 
     let ret = sorted_blocks
-        .iter()
+        .par_iter()
         .map(|b| (b.meta.curr_part, &b.data))
         .zip(ratio_list)
-        .fold(
-            BigInt::from(0),
-            |acc, ((curr_part, big_data), (part_num, ratio))| {
-                assert_eq!(curr_part, part_num);
-                acc + big_data * ratio.numer() / ratio.denom()
-            },
-    );
+        .map(|((curr_part, big_data), (part_num, ratio))| {
+            assert_eq!(curr_part, part_num);
+            big_data * ratio.numer() / ratio.denom()
+        })
+        .sum();
     info!(part_num, "end interpolating");
     ret
 }
@@ -267,7 +265,9 @@ impl DataBlock {
         } else {
             calc_padding_size(tail_padded_len as usize)
         };
-        meta.padding = head_padding_size;
+        if meta.padding == 0 {
+            meta.padding = head_padding_size;
+        }
         let vec_cap = head_padding_size + tail_padded_len;
         let mut data = vec![0xffu8; vec_cap];
 

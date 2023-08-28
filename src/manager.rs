@@ -83,7 +83,7 @@ impl Manager {
             .collect::<Vec<_>>();
 
         let result: anyhow::Result<Vec<_>> = paths
-            .par_iter()
+            .iter()
             .enumerate()
             .map(|(chunk_idx, dest_path)| -> anyhow::Result<()> {
                 let chunk_idx = chunk_idx as u64;
